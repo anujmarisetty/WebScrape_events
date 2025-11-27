@@ -67,12 +67,19 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
         return fetch_page(url)
     
     options = webdriver.ChromeOptions()
-    options.add_argument('--headless')  # Run in background
+    options.add_argument('--headless=new')  # Use new headless mode
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--disable-gpu')
+    options.add_argument('--disable-blink-features=AutomationControlled')  # Avoid detection
     options.add_argument('--window-size=1920,1080')
-    options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
+    options.add_argument('--start-maximized')
+    options.add_argument('--disable-extensions')
+    options.add_argument('--disable-infobars')
+    options.add_argument('--disable-notifications')
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument('user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
     
     driver = None
     try:
@@ -80,18 +87,38 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
         # Use webdriver-manager to automatically handle ChromeDriver
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+        
+        # Execute script to avoid detection
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': '''
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+            '''
+        })
+        
+        logger.info(f"Loading URL: {url}")
         driver.get(url)
         
         # Wait for page to load and content to appear
-        wait = WebDriverWait(driver, 10)
+        wait = WebDriverWait(driver, 20)
         try:
-            # Wait for any content to load (look for body or main content)
-            wait.until(lambda d: len(d.page_source) > 1000)
+            # Wait for page to have substantial content
+            wait.until(lambda d: len(d.page_source) > 10000)
+            logger.info(f"Initial page loaded: {len(driver.page_source)} characters")
         except TimeoutException:
-            logger.warning("Page took too long to load initial content")
+            logger.warning(f"Page took too long to load. Current size: {len(driver.page_source)} characters")
         
-        # Additional wait for dynamic content
-        time.sleep(3)
+        # Wait for JavaScript to execute and content to render
+        time.sleep(5)
+        
+        # Scroll to bottom to trigger lazy loading
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        
+        # Scroll back to top
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(2)
         
         # Click "view more" buttons multiple times
         click_count = 0
@@ -113,20 +140,27 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
                 button_found = False
                 for selector in view_more_selectors:
                     try:
-                        wait = WebDriverWait(driver, 2)
-                        button = wait.until(EC.element_to_be_clickable((By.XPATH, selector)))
-                        if button.is_displayed():
+                        wait = WebDriverWait(driver, 5)
+                        button = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
+                        if button.is_displayed() and button.is_enabled():
                             # Scroll to button
-                            driver.execute_script("arguments[0].scrollIntoView(true);", button)
-                            time.sleep(0.5)
-                            # Click button
-                            button.click()
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+                            time.sleep(1)
+                            # Try JavaScript click first (more reliable in headless)
+                            try:
+                                driver.execute_script("arguments[0].click();", button)
+                            except:
+                                button.click()
                             click_count += 1
                             logger.info(f"Clicked 'view more' button (click {click_count}/{max_clicks})")
-                            time.sleep(2)  # Wait for content to load
+                            # Wait for new content to load
+                            time.sleep(3)
+                            # Scroll to bottom to trigger more loading
+                            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                            time.sleep(1)
                             button_found = True
                             break
-                    except (TimeoutException, NoSuchElementException):
+                    except (TimeoutException, NoSuchElementException) as e:
                         continue
                 
                 if not button_found:
@@ -142,11 +176,17 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
         logger.info(f"Successfully fetched page with Selenium ({len(html)} characters, {click_count} clicks)")
         
         # Debug: Check if we got meaningful content
-        if len(html) < 5000:
+        if len(html) < 50000:
             logger.warning(f"Page content seems small ({len(html)} chars). Page might not have loaded correctly.")
-            # Try to find if there's an error message or empty state
+            # Log a snippet of the HTML to debug
+            logger.debug(f"HTML snippet (first 500 chars): {html[:500]}")
+            # Check for common error indicators
             if "no events" in html.lower() or "no results" in html.lower():
                 logger.warning("Page indicates no events found")
+            # Check if page loaded at all
+            if len(html) < 1000:
+                logger.error("Page content is extremely small. Page may not have loaded at all.")
+                raise Exception(f"Page content too small ({len(html)} chars). Page likely didn't load.")
         
         return html
         
@@ -420,10 +460,20 @@ def main():
             date_url = get_date_url(target_date)
             
             # Fetch the page (try with Selenium to handle "view more" button)
+            html = None
             try:
                 html = fetch_page_with_selenium(date_url)
+                # Verify we got meaningful content
+                if html and len(html) < 10000:
+                    logger.warning(f"Selenium returned small page ({len(html)} chars). Trying regular fetch as fallback.")
+                    html = None  # Force fallback
             except Exception as e:
-                logger.warning(f"Selenium fetch failed, using regular fetch: {e}")
+                logger.warning(f"Selenium fetch failed: {e}. Using regular fetch as fallback.")
+                html = None
+            
+            # Fallback to regular requests if Selenium failed or returned insufficient content
+            if html is None or len(html) < 10000:
+                logger.info("Using regular HTTP fetch (fallback)")
                 html = fetch_page(date_url)
             
             # Parse events for this date
