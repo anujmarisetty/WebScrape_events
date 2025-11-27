@@ -82,8 +82,16 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
         driver = webdriver.Chrome(service=service, options=options)
         driver.get(url)
         
-        # Wait for page to load
-        time.sleep(2)
+        # Wait for page to load and content to appear
+        wait = WebDriverWait(driver, 10)
+        try:
+            # Wait for any content to load (look for body or main content)
+            wait.until(lambda d: len(d.page_source) > 1000)
+        except TimeoutException:
+            logger.warning("Page took too long to load initial content")
+        
+        # Additional wait for dynamic content
+        time.sleep(3)
         
         # Click "view more" buttons multiple times
         click_count = 0
@@ -132,6 +140,14 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
         # Get final page source
         html = driver.page_source
         logger.info(f"Successfully fetched page with Selenium ({len(html)} characters, {click_count} clicks)")
+        
+        # Debug: Check if we got meaningful content
+        if len(html) < 5000:
+            logger.warning(f"Page content seems small ({len(html)} chars). Page might not have loaded correctly.")
+            # Try to find if there's an error message or empty state
+            if "no events" in html.lower() or "no results" in html.lower():
+                logger.warning("Page indicates no events found")
+        
         return html
         
     except Exception as e:
@@ -297,24 +313,9 @@ def save_to_excel(events_by_date: dict, output_path: str):
             # Sort dates
             sorted_dates = sorted(events_by_date.keys())
             
+            sheets_created = 0
             for target_date in sorted_dates:
                 events = events_by_date[target_date]
-                if not events:
-                    logger.info(f"No events for {target_date}, skipping sheet")
-                    continue
-                
-                # Create DataFrame for this date
-                df = pd.DataFrame(events)
-                
-                # Remove duplicates within this day (based on event link)
-                df = df.drop_duplicates(subset=['Event link'], keep='first')
-                
-                # Sort by event name for better organization
-                df = df.sort_values("Event name")
-                df = df.reset_index(drop=True)
-                
-                # Add serial number
-                df.insert(0, "S.no", range(1, len(df) + 1))
                 
                 # Create sheet name (Excel sheet names have limitations)
                 sheet_name = target_date.strftime("%Y-%m-%d")
@@ -322,9 +323,37 @@ def save_to_excel(events_by_date: dict, output_path: str):
                 if len(sheet_name) > 31:
                     sheet_name = sheet_name[:31]
                 
-                # Write to sheet
+                if not events:
+                    logger.info(f"No events for {target_date}, creating empty sheet")
+                    # Create empty DataFrame with correct columns
+                    df = pd.DataFrame(columns=["S.no", "Date", "Event name", "Event link"])
+                else:
+                    # Create DataFrame for this date
+                    df = pd.DataFrame(events)
+                    
+                    # Remove duplicates within this day (based on event link)
+                    df = df.drop_duplicates(subset=['Event link'], keep='first')
+                    
+                    # Sort by event name for better organization
+                    df = df.sort_values("Event name")
+                    df = df.reset_index(drop=True)
+                    
+                    # Add serial number
+                    df.insert(0, "S.no", range(1, len(df) + 1))
+                
+                # Write to sheet (even if empty)
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
-                logger.info(f"Saved {len(df)} events to sheet '{sheet_name}'")
+                sheets_created += 1
+                if events:
+                    logger.info(f"Saved {len(df)} events to sheet '{sheet_name}'")
+                else:
+                    logger.info(f"Created empty sheet '{sheet_name}' (no events found)")
+            
+            # Ensure at least one sheet exists (Excel requirement)
+            if sheets_created == 0:
+                logger.warning("No sheets created, creating a summary sheet")
+                df = pd.DataFrame(columns=["S.no", "Date", "Event name", "Event link"])
+                df.to_excel(writer, sheet_name="Summary", index=False)
         
         logger.info(f"Saved all events to {output_path}")
         
