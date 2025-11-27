@@ -38,7 +38,8 @@ ENV/
 Thumbs.db
 
 # Project specific
-output/*.xlsx
+# Ignore all output files (Excel files from local testing)
+output/*
 !output/.gitkeep
 
 # Logs
