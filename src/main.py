@@ -7,7 +7,10 @@ from pathlib import Path
 import logging
 import sys
 import time
-from openpyxl import load_workbook
+import tempfile
+import os
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # Configure logging first
 logging.basicConfig(
@@ -41,33 +44,89 @@ OUTPUT_DIR = Path(__file__).parent.parent / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 
-def fetch_page(url: str) -> str:
-    """Fetch HTML content from the given URL with error handling."""
+def fetch_page(url: str, max_retries: int = 3) -> str:
+    """Fetch HTML content from the given URL with error handling and retry logic."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
-    try:
-        logger.info(f"[HTTP] Fetching page: {url}")
-        logger.debug(f"[HTTP] Using headers: {headers}")
-        resp = requests.get(url, headers=headers, timeout=20)
-        logger.info(f"[HTTP] Response status: {resp.status_code}")
-        logger.info(f"[HTTP] Response headers: Content-Type={resp.headers.get('Content-Type', 'N/A')}, Content-Length={resp.headers.get('Content-Length', 'N/A')}")
-        resp.raise_for_status()
-        html = resp.text
-        logger.info(f"[HTTP] Successfully fetched page ({len(html)} characters)")
-        
-        # Log some HTML content for debugging
-        logger.debug(f"[HTTP] HTML preview (first 200 chars): {html[:200]}")
-        logger.debug(f"[HTTP] HTML contains 'events': {'events' in html.lower()}")
-        logger.debug(f"[HTTP] HTML contains 'view more': {'view more' in html.lower()}")
-        logger.debug(f"[HTTP] Number of '<a' tags: {html.count('<a')}")
-        logger.debug(f"[HTTP] Number of '/events/' in HTML: {html.count('/events/')}")
-        
-        return html
-    except requests.exceptions.RequestException as e:
-        logger.error(f"[HTTP] Error fetching {url}: {e}")
-        logger.error(f"[HTTP] Exception type: {type(e).__name__}")
-        raise
+    
+    # Create session with retry strategy
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=max_retries,
+        backoff_factor=2,  # Wait 2, 4, 8 seconds between retries
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"[HTTP] Fetching page: {url} (attempt {attempt + 1}/{max_retries})")
+            logger.debug(f"[HTTP] Using headers: {headers}")
+            
+            resp = session.get(url, headers=headers, timeout=30)
+            logger.info(f"[HTTP] Response status: {resp.status_code}")
+            logger.info(f"[HTTP] Response headers: Content-Type={resp.headers.get('Content-Type', 'N/A')}, Content-Length={resp.headers.get('Content-Length', 'N/A')}")
+            
+            # Handle rate limiting
+            if resp.status_code == 429:
+                retry_after = resp.headers.get('Retry-After', '60')
+                try:
+                    wait_time = int(retry_after)
+                except ValueError:
+                    wait_time = 60 * (attempt + 1)  # Default to exponential backoff
+                
+                if attempt < max_retries - 1:
+                    logger.warning(f"[HTTP] Rate limited (429). Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"[HTTP] Rate limited (429) after {max_retries} attempts. Giving up.")
+                    raise requests.exceptions.HTTPError(f"429 Client Error: Too Many Requests after {max_retries} attempts")
+            
+            resp.raise_for_status()
+            html = resp.text
+            logger.info(f"[HTTP] Successfully fetched page ({len(html)} characters)")
+            
+            # Log some HTML content for debugging
+            logger.debug(f"[HTTP] HTML preview (first 200 chars): {html[:200]}")
+            logger.debug(f"[HTTP] HTML contains 'events': {'events' in html.lower()}")
+            logger.debug(f"[HTTP] HTML contains 'view more': {'view more' in html.lower()}")
+            logger.debug(f"[HTTP] Number of '<a' tags: {html.count('<a')}")
+            logger.debug(f"[HTTP] Number of '/events/' in HTML: {html.count('/events/')}")
+            
+            return html
+            
+        except requests.exceptions.HTTPError as e:
+            if e.response and e.response.status_code == 429:
+                if attempt < max_retries - 1:
+                    wait_time = 60 * (attempt + 1)
+                    logger.warning(f"[HTTP] Rate limited. Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+            logger.error(f"[HTTP] Error fetching {url}: {e}")
+            logger.error(f"[HTTP] Exception type: {type(e).__name__}")
+            if attempt == max_retries - 1:
+                raise
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[HTTP] Request error: {e}")
+            logger.error(f"[HTTP] Exception type: {type(e).__name__}")
+            if attempt == max_retries - 1:
+                raise
+            # Wait before retry
+            wait_time = 5 * (attempt + 1)
+            logger.warning(f"[HTTP] Waiting {wait_time} seconds before retry...")
+            time.sleep(wait_time)
+    
+    raise Exception(f"Failed to fetch {url} after {max_retries} attempts")
 
 
 def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
@@ -279,7 +338,7 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
                 logger.error("Page content is extremely small. Page may not have loaded at all.")
                 # Try to get a screenshot for debugging (if possible)
                 try:
-                    screenshot_path = f"/tmp/selenium_debug_{int(time.time())}.png"
+                    screenshot_path = os.path.join(tempfile.gettempdir(), f"selenium_debug_{int(time.time())}.png")
                     driver.save_screenshot(screenshot_path)
                     logger.info(f"Screenshot saved to {screenshot_path}")
                 except:
@@ -568,6 +627,11 @@ def main():
             logger.info(f"Processing date: {target_date} (day {day_offset + 1}/7)")
             logger.info(f"{'='*60}")
             
+            # Add delay before first request to avoid immediate rate limiting
+            if day_offset == 0:
+                logger.info("[MAIN] Waiting 3 seconds before first request...")
+                time.sleep(3)
+            
             # Get date-specific URL
             date_url = get_date_url(target_date)
             
@@ -624,9 +688,11 @@ def main():
             else:
                 logger.info(f"Found {len(events)} events for {target_date}")
             
-            # Small delay to be respectful to the server
+            # Delay between requests to avoid rate limiting
             if day_offset < 6:  # Don't delay after last day
-                time.sleep(1)
+                delay = 5  # 5 seconds between requests
+                logger.info(f"[MAIN] Waiting {delay} seconds before next request to avoid rate limiting...")
+                time.sleep(delay)
         
         # Save to Excel with separate sheets for each day
         output_path = get_output_filename()
