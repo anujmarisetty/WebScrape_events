@@ -150,7 +150,7 @@ def fetch_page(url: str, max_retries: int = 3) -> str:
     raise Exception(f"Failed to fetch {url} after {max_retries} attempts")
 
 
-def fetch_page_with_selenium(url: str, max_clicks: int = 5) -> str:
+def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
     """
     Fetch HTML content using Selenium, clicking 'view more' buttons to load all events.
     Returns the final HTML after all clicks.
@@ -225,8 +225,8 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 5) -> str:
                 logger.error(f"[SELENIUM] Error getting page info: {e}")
         
         # Wait for JavaScript to execute and content to render
-        logger.info("[SELENIUM] Waiting for JavaScript to execute (3 seconds)...")
-        time.sleep(3)  # Reduced wait time for speed
+        logger.info("[SELENIUM] Waiting for JavaScript to execute (5 seconds)...")
+        time.sleep(5)  # Increased to ensure content loads properly
         
         # Check page state before looking for elements
         initial_size = len(driver.page_source)
@@ -304,14 +304,23 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 5) -> str:
                             except Exception as e:
                                 logger.debug(f"[SELENIUM] JavaScript click failed, trying regular click: {e}")
                                 button.click()
+                            page_size_before = len(driver.page_source)
                             click_count += 1
+                            
+                            # Wait for new content to load
+                            time.sleep(2)  # Increased to ensure content loads
                             page_size_after = len(driver.page_source)
-                            logger.info(f"[SELENIUM] Clicked 'view more' button (click {click_count}/{max_clicks}). Page size now: {page_size_after} chars")
-                            # Wait for new content to load (reduced wait time)
-                            time.sleep(1.5)  # Reduced from 3 seconds
+                            
+                            # Check if content actually increased
+                            size_increase = page_size_after - page_size_before
+                            logger.info(f"[SELENIUM] Clicked 'view more' button (click {click_count}/{max_clicks}). Page size: {page_size_before} -> {page_size_after} chars (+{size_increase})")
+                            
                             # Scroll to bottom to trigger more loading
                             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                            time.sleep(0.5)  # Reduced wait time
+                            time.sleep(1)  # Increased wait time
+                            
+                            # If page size didn't increase much, the button might not have loaded new content
+                            # But continue anyway as sometimes content loads asynchronously
                             button_found = True
                             break
                     except (TimeoutException, NoSuchElementException) as e:
@@ -319,7 +328,7 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 5) -> str:
                         continue
                 
                 if not button_found:
-                    logger.info(f"[SELENIUM] No more 'view more' buttons found after {click_count} clicks")
+                    logger.info(f"[SELENIUM] No more 'view more' buttons found after {click_count} clicks. All events should be loaded.")
                     break
                     
             except Exception as e:
