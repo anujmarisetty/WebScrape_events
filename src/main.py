@@ -174,11 +174,27 @@ def parse_events_for_date(html: str, target_date: date) -> list:
     rows = []
     seen_links = set()  # Prevent duplicates for this day
     
+    # Debug: Check page content
+    page_text = soup.get_text()[:500] if soup else ""
+    logger.debug(f"Page preview (first 500 chars): {page_text}")
+    
     # Find all event links on the page
     # Shotgun uses various structures, so we'll look for links containing "/events/"
     event_links = soup.find_all("a", href=lambda x: x and "/events/" in str(x))
     
     logger.info(f"Found {len(event_links)} potential event links for {target_date}")
+    
+    # If no links found, try alternative selectors
+    if len(event_links) == 0:
+        logger.warning(f"No event links found with '/events/' pattern. Trying alternative methods...")
+        # Try finding any links that might be events
+        all_links = soup.find_all("a", href=True)
+        logger.info(f"Total links on page: {len(all_links)}")
+        # Look for links with event-like patterns
+        for link in all_links[:50]:  # Check first 50 links
+            href = link.get("href", "")
+            if href and ("event" in href.lower() or "paris" in href.lower()):
+                logger.debug(f"Found potential event link: {href[:100]}")
     
     for link in event_links:
         href = link.get("href", "")
@@ -289,8 +305,9 @@ def save_to_excel(events_by_date: dict, output_path: str):
     events_by_date: dict mapping date (date object) to list of event dicts
     """
     if not events_by_date:
-        logger.warning("No events found for next seven days")
-        return
+        logger.warning("No events_by_date dictionary provided, creating empty file")
+        # Still create a file with a summary sheet
+        events_by_date = {date.today(): []}
     
     # Check if file exists and is locked
     output_path_obj = Path(output_path)
@@ -325,8 +342,13 @@ def save_to_excel(events_by_date: dict, output_path: str):
                 
                 if not events:
                     logger.info(f"No events for {target_date}, creating empty sheet")
-                    # Create empty DataFrame with correct columns
-                    df = pd.DataFrame(columns=["S.no", "Date", "Event name", "Event link"])
+                    # Create empty DataFrame with correct columns and a message row
+                    df = pd.DataFrame({
+                        "S.no": [""],
+                        "Date": [target_date.isoformat()],
+                        "Event name": ["No events found for this date"],
+                        "Event link": [""]
+                    })
                 else:
                     # Create DataFrame for this date
                     df = pd.DataFrame(events)
@@ -352,8 +374,15 @@ def save_to_excel(events_by_date: dict, output_path: str):
             # Ensure at least one sheet exists (Excel requirement)
             if sheets_created == 0:
                 logger.warning("No sheets created, creating a summary sheet")
-                df = pd.DataFrame(columns=["S.no", "Date", "Event name", "Event link"])
+                today = date.today()
+                df = pd.DataFrame({
+                    "S.no": [""],
+                    "Date": [today.isoformat()],
+                    "Event name": ["No events found for any date"],
+                    "Event link": [""]
+                })
                 df.to_excel(writer, sheet_name="Summary", index=False)
+                sheets_created = 1
         
         logger.info(f"Saved all events to {output_path}")
         
@@ -400,11 +429,13 @@ def main():
             # Parse events for this date
             events = parse_events_for_date(html, target_date)
             
-            if events:
-                events_by_date[target_date] = events
-            else:
+            # Always add the date to events_by_date, even if empty
+            events_by_date[target_date] = events if events else []
+            
+            if not events:
                 logger.warning(f"No events found for {target_date}")
-                events_by_date[target_date] = []  # Keep empty list to create empty sheet
+            else:
+                logger.info(f"Found {len(events)} events for {target_date}")
             
             # Small delay to be respectful to the server
             if day_offset < 6:  # Don't delay after last day
