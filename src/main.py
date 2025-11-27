@@ -56,12 +56,14 @@ def fetch_page(url: str, max_retries: int = 3) -> str:
     }
     
     # Create session with retry strategy
+    # Note: We exclude 429 from status_forcelist to handle it manually with longer waits
     session = requests.Session()
     retry_strategy = Retry(
-        total=max_retries,
-        backoff_factor=2,  # Wait 2, 4, 8 seconds between retries
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
+        total=1,  # Only retry once automatically (for non-429 errors)
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],  # Exclude 429 - handle manually
+        allowed_methods=["GET"],
+        respect_retry_after_header=True
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
@@ -78,11 +80,15 @@ def fetch_page(url: str, max_retries: int = 3) -> str:
             
             # Handle rate limiting
             if resp.status_code == 429:
-                retry_after = resp.headers.get('Retry-After', '60')
-                try:
-                    wait_time = int(retry_after)
-                except ValueError:
-                    wait_time = 60 * (attempt + 1)  # Default to exponential backoff
+                retry_after = resp.headers.get('Retry-After', None)
+                if retry_after:
+                    try:
+                        wait_time = int(retry_after)
+                    except ValueError:
+                        wait_time = 120  # Default to 2 minutes if header is invalid
+                else:
+                    # Exponential backoff: 60s, 120s, 180s
+                    wait_time = 60 + (attempt * 60)
                 
                 if attempt < max_retries - 1:
                     logger.warning(f"[HTTP] Rate limited (429). Waiting {wait_time} seconds before retry...")
@@ -108,7 +114,7 @@ def fetch_page(url: str, max_retries: int = 3) -> str:
         except requests.exceptions.HTTPError as e:
             if e.response and e.response.status_code == 429:
                 if attempt < max_retries - 1:
-                    wait_time = 60 * (attempt + 1)
+                    wait_time = 60 + (attempt * 60)  # 60s, 120s, 180s
                     logger.warning(f"[HTTP] Rate limited. Waiting {wait_time} seconds before retry...")
                     time.sleep(wait_time)
                     continue
@@ -116,13 +122,28 @@ def fetch_page(url: str, max_retries: int = 3) -> str:
             logger.error(f"[HTTP] Exception type: {type(e).__name__}")
             if attempt == max_retries - 1:
                 raise
-        except requests.exceptions.RequestException as e:
+            # Wait before retry for other HTTP errors
+            wait_time = 10 * (attempt + 1)
+            logger.warning(f"[HTTP] Waiting {wait_time} seconds before retry...")
+            time.sleep(wait_time)
+        except (requests.exceptions.RetryError, requests.exceptions.RequestException) as e:
+            # Handle urllib3's RetryError which occurs when too many 429s happen
+            error_str = str(e).lower()
+            if '429' in error_str or 'too many' in error_str:
+                if attempt < max_retries - 1:
+                    wait_time = 120 + (attempt * 60)  # Longer wait for rate limiting: 120s, 180s, 240s
+                    logger.warning(f"[HTTP] Rate limited (RetryError). Waiting {wait_time} seconds before retry...")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"[HTTP] Rate limited after {max_retries} attempts. Consider using Selenium instead.")
+                    raise requests.exceptions.HTTPError(f"429 Client Error: Too Many Requests after {max_retries} attempts")
             logger.error(f"[HTTP] Request error: {e}")
             logger.error(f"[HTTP] Exception type: {type(e).__name__}")
             if attempt == max_retries - 1:
                 raise
             # Wait before retry
-            wait_time = 5 * (attempt + 1)
+            wait_time = 10 * (attempt + 1)
             logger.warning(f"[HTTP] Waiting {wait_time} seconds before retry...")
             time.sleep(wait_time)
     
@@ -629,49 +650,83 @@ def main():
             
             # Add delay before first request to avoid immediate rate limiting
             if day_offset == 0:
-                logger.info("[MAIN] Waiting 3 seconds before first request...")
-                time.sleep(3)
+                logger.info("[MAIN] Waiting 5 seconds before first request...")
+                time.sleep(5)
+            else:
+                # Longer delay between requests to avoid rate limiting
+                delay = 10  # 10 seconds between requests
+                logger.info(f"[MAIN] Waiting {delay} seconds before next request to avoid rate limiting...")
+                time.sleep(delay)
             
             # Get date-specific URL
             date_url = get_date_url(target_date)
             
-            # Strategy: Try regular fetch first, then use Selenium only if we detect "view more" buttons
+            # Strategy: Try regular fetch first, then use Selenium if needed or if rate limited
             # This avoids headless detection issues in CI environments
             logger.info(f"[MAIN] Fetching events for {target_date}...")
-            html = fetch_page(date_url)
-            initial_size = len(html)
-            logger.info(f"[MAIN] Initial HTTP fetch returned {initial_size} characters")
+            html = None
+            initial_size = 0
+            use_selenium_directly = False
+            
+            try:
+                html = fetch_page(date_url)
+                initial_size = len(html)
+                logger.info(f"[MAIN] Initial HTTP fetch returned {initial_size} characters")
+            except (requests.exceptions.HTTPError, requests.exceptions.RetryError) as e:
+                error_str = str(e).lower()
+                if '429' in error_str or 'too many' in error_str:
+                    logger.warning(f"[MAIN] HTTP fetch failed due to rate limiting. Falling back to Selenium...")
+                    use_selenium_directly = True
+                else:
+                    logger.error(f"[MAIN] HTTP fetch failed: {e}")
+                    raise
             
             # Check if page has "view more" buttons that need clicking
-            html_lower = html.lower()
-            has_view_more = any(phrase in html_lower for phrase in [
-                "view more", "see more", "load more", "show more"
-            ])
-            logger.info(f"[MAIN] Page contains 'view more' buttons: {has_view_more}")
-            logger.info(f"[MAIN] Checking if Selenium is needed (content < 50KB or has 'view more' buttons)...")
+            if html:
+                html_lower = html.lower()
+                has_view_more = any(phrase in html_lower for phrase in [
+                    "view more", "see more", "load more", "show more"
+                ])
+                logger.info(f"[MAIN] Page contains 'view more' buttons: {has_view_more}")
+                logger.info(f"[MAIN] Checking if Selenium is needed (content < 50KB or has 'view more' buttons)...")
+            else:
+                has_view_more = True  # Assume we need Selenium if HTTP failed
             
-            # Also check if we got sufficient content
-            if initial_size < 50000 or has_view_more:
-                logger.info(f"[MAIN] Conditions met for Selenium: size={initial_size} (< 50000) or has_view_more={has_view_more}")
+            # Also check if we got sufficient content or if we should use Selenium directly
+            if use_selenium_directly or initial_size < 50000 or has_view_more:
+                if use_selenium_directly:
+                    logger.info(f"[MAIN] Using Selenium directly due to rate limiting")
+                else:
+                    logger.info(f"[MAIN] Conditions met for Selenium: size={initial_size} (< 50000) or has_view_more={has_view_more}")
                 logger.info("[MAIN] Attempting Selenium fetch...")
                 try:
                     selenium_html = fetch_page_with_selenium(date_url)
                     selenium_size = len(selenium_html)
                     logger.info(f"[MAIN] Selenium fetch completed: {selenium_size} characters")
                     
-                    # Only use Selenium result if it's significantly better
-                    improvement_ratio = selenium_size / initial_size if initial_size > 0 else 0
-                    logger.info(f"[MAIN] Content comparison: Selenium={selenium_size} chars, HTTP={initial_size} chars, Ratio={improvement_ratio:.2f}x")
-                    
-                    if selenium_size > initial_size * 1.5:  # At least 50% more content
-                        logger.info(f"[MAIN] ✓ Using Selenium result (improvement: {improvement_ratio:.2f}x)")
+                    if use_selenium_directly:
+                        # If HTTP failed, use Selenium result directly
+                        logger.info(f"[MAIN] ✓ Using Selenium result (HTTP fetch failed due to rate limiting)")
                         html = selenium_html
                     else:
-                        logger.warning(f"[MAIN] ✗ Selenium didn't improve content enough. Using HTTP result.")
-                        logger.warning(f"[MAIN]   Selenium: {selenium_size} chars, HTTP: {initial_size} chars")
+                        # Only use Selenium result if it's significantly better
+                        improvement_ratio = selenium_size / initial_size if initial_size > 0 else 0
+                        logger.info(f"[MAIN] Content comparison: Selenium={selenium_size} chars, HTTP={initial_size} chars, Ratio={improvement_ratio:.2f}x")
+                        
+                        if selenium_size > initial_size * 1.5:  # At least 50% more content
+                            logger.info(f"[MAIN] ✓ Using Selenium result (improvement: {improvement_ratio:.2f}x)")
+                            html = selenium_html
+                        else:
+                            logger.warning(f"[MAIN] ✗ Selenium didn't improve content enough. Using HTTP result.")
+                            logger.warning(f"[MAIN]   Selenium: {selenium_size} chars, HTTP: {initial_size} chars")
                 except Exception as e:
                     logger.error(f"[MAIN] Selenium failed with exception: {type(e).__name__}: {e}")
-                    logger.warning("[MAIN] Continuing with HTTP fetch result")
+                    if use_selenium_directly:
+                        # If Selenium fails and HTTP already failed, we're stuck
+                        logger.error("[MAIN] Both HTTP and Selenium failed. Cannot proceed.")
+                        raise
+                    else:
+                        logger.warning("[MAIN] Continuing with HTTP fetch result")
             else:
                 logger.info(f"[MAIN] Regular fetch provided sufficient content ({initial_size} chars), skipping Selenium")
             
@@ -688,11 +743,7 @@ def main():
             else:
                 logger.info(f"Found {len(events)} events for {target_date}")
             
-            # Delay between requests to avoid rate limiting
-            if day_offset < 6:  # Don't delay after last day
-                delay = 5  # 5 seconds between requests
-                logger.info(f"[MAIN] Waiting {delay} seconds before next request to avoid rate limiting...")
-                time.sleep(delay)
+            # Delay is now handled at the start of each loop iteration
         
         # Save to Excel with separate sheets for each day
         output_path = get_output_filename()
