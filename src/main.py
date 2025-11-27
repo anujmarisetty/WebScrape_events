@@ -150,7 +150,7 @@ def fetch_page(url: str, max_retries: int = 3) -> str:
     raise Exception(f"Failed to fetch {url} after {max_retries} attempts")
 
 
-def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
+def fetch_page_with_selenium(url: str, max_clicks: int = 5) -> str:
     """
     Fetch HTML content using Selenium, clicking 'view more' buttons to load all events.
     Returns the final HTML after all clicks.
@@ -225,8 +225,8 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
                 logger.error(f"[SELENIUM] Error getting page info: {e}")
         
         # Wait for JavaScript to execute and content to render
-        logger.info("[SELENIUM] Waiting for JavaScript to execute (8 seconds)...")
-        time.sleep(8)  # Increased wait time
+        logger.info("[SELENIUM] Waiting for JavaScript to execute (3 seconds)...")
+        time.sleep(3)  # Reduced wait time for speed
         
         # Check page state before looking for elements
         initial_size = len(driver.page_source)
@@ -249,14 +249,14 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
         # Scroll to bottom to trigger lazy loading
         logger.info("[SELENIUM] Scrolling to bottom to trigger lazy loading...")
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(3)
+        time.sleep(1)  # Reduced wait time
         after_scroll_size = len(driver.page_source)
         logger.info(f"[SELENIUM] After scrolling down - Page size: {after_scroll_size} chars")
         
         # Scroll back to top
         logger.info("[SELENIUM] Scrolling back to top...")
         driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(2)
+        time.sleep(0.5)  # Reduced wait time
         
         # Check final page state
         final_size = len(driver.page_source)
@@ -287,7 +287,7 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
                 for i, selector in enumerate(view_more_selectors):
                     try:
                         logger.debug(f"[SELENIUM] Trying selector {i+1}/{len(view_more_selectors)}: {selector[:50]}...")
-                        wait = WebDriverWait(driver, 5)
+                        wait = WebDriverWait(driver, 2)  # Reduced timeout from 5 to 2 seconds
                         button = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
                         is_displayed = button.is_displayed()
                         is_enabled = button.is_enabled()
@@ -296,7 +296,7 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
                             # Scroll to button
                             logger.debug("[SELENIUM] Scrolling to button...")
                             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
-                            time.sleep(1)
+                            time.sleep(0.3)  # Reduced wait time
                             # Try JavaScript click first (more reliable in headless)
                             try:
                                 logger.debug("[SELENIUM] Attempting JavaScript click...")
@@ -307,11 +307,11 @@ def fetch_page_with_selenium(url: str, max_clicks: int = 10) -> str:
                             click_count += 1
                             page_size_after = len(driver.page_source)
                             logger.info(f"[SELENIUM] Clicked 'view more' button (click {click_count}/{max_clicks}). Page size now: {page_size_after} chars")
-                            # Wait for new content to load
-                            time.sleep(3)
+                            # Wait for new content to load (reduced wait time)
+                            time.sleep(1.5)  # Reduced from 3 seconds
                             # Scroll to bottom to trigger more loading
                             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                            time.sleep(1)
+                            time.sleep(0.5)  # Reduced wait time
                             button_found = True
                             break
                     except (TimeoutException, NoSuchElementException) as e:
@@ -650,36 +650,43 @@ def main():
             
             # Add delay before first request to avoid immediate rate limiting
             if day_offset == 0:
-                logger.info("[MAIN] Waiting 5 seconds before first request...")
-                time.sleep(5)
+                logger.info("[MAIN] Waiting 2 seconds before first request...")
+                time.sleep(2)
             else:
-                # Longer delay between requests to avoid rate limiting
-                delay = 10  # 10 seconds between requests
-                logger.info(f"[MAIN] Waiting {delay} seconds before next request to avoid rate limiting...")
+                # Delay between requests to avoid rate limiting
+                delay = 3  # 3 seconds between requests (reduced for speed)
+                logger.info(f"[MAIN] Waiting {delay} seconds before next request...")
                 time.sleep(delay)
             
             # Get date-specific URL
             date_url = get_date_url(target_date)
             
-            # Strategy: Try regular fetch first, then use Selenium if needed or if rate limited
-            # This avoids headless detection issues in CI environments
-            logger.info(f"[MAIN] Fetching events for {target_date}...")
+            # Strategy: In CI environments, skip HTTP fetch and go straight to Selenium to save time
+            # In local environments, try HTTP first, then fall back to Selenium if needed
+            is_ci = os.getenv('CI') or os.getenv('GITHUB_ACTIONS') or os.getenv('RUNNER_OS')
             html = None
             initial_size = 0
             use_selenium_directly = False
             
-            try:
-                html = fetch_page(date_url)
-                initial_size = len(html)
-                logger.info(f"[MAIN] Initial HTTP fetch returned {initial_size} characters")
-            except (requests.exceptions.HTTPError, requests.exceptions.RetryError) as e:
-                error_str = str(e).lower()
-                if '429' in error_str or 'too many' in error_str:
-                    logger.warning(f"[MAIN] HTTP fetch failed due to rate limiting. Falling back to Selenium...")
-                    use_selenium_directly = True
-                else:
-                    logger.error(f"[MAIN] HTTP fetch failed: {e}")
-                    raise
+            if is_ci:
+                # Skip HTTP fetch in CI to avoid rate limiting and save time
+                logger.info(f"[MAIN] CI environment detected. Skipping HTTP fetch, using Selenium directly...")
+                use_selenium_directly = True
+            else:
+                # Try regular fetch first, then use Selenium if needed or if rate limited
+                logger.info(f"[MAIN] Fetching events for {target_date}...")
+                try:
+                    html = fetch_page(date_url)
+                    initial_size = len(html)
+                    logger.info(f"[MAIN] Initial HTTP fetch returned {initial_size} characters")
+                except (requests.exceptions.HTTPError, requests.exceptions.RetryError) as e:
+                    error_str = str(e).lower()
+                    if '429' in error_str or 'too many' in error_str:
+                        logger.warning(f"[MAIN] HTTP fetch failed due to rate limiting. Falling back to Selenium...")
+                        use_selenium_directly = True
+                    else:
+                        logger.error(f"[MAIN] HTTP fetch failed: {e}")
+                        raise
             
             # Check if page has "view more" buttons that need clicking
             if html:
