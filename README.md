@@ -58,9 +58,14 @@ The Excel file contains:
 
 The repository includes a GitHub Actions workflow that:
 - Runs every Monday at 9:00 AM UTC
-- Scrapes the latest events
+- Scrapes the latest events for the next 7 days
+- Handles "view more" buttons using Selenium
 - Commits the Excel file to the repository
-- Creates a new file with the current date in the filename
+- Creates separate sheets for each day in the Excel file
+
+**Setup Instructions**: See [GITHUB_ACTIONS_SETUP.md](GITHUB_ACTIONS_SETUP.md) for detailed setup instructions.
+
+**Is it free?** Yes! GitHub Actions is free for public repositories. For private repos, you get 2,000 free minutes/month (this workflow uses ~20-25 minutes/month).
 
 The workflow file is located at `.github/workflows/scrape-events.yml`.
 
